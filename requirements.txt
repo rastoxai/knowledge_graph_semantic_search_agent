@@ -1,0 +1,19 @@
+#Agent Orchestration
+
+langchain
+langchain-community
+
+#Vector Database (Simulates Lucene Vector Index)
+
+chromadb
+#Knowledge Graph
+neo4j
+
+#Embedding Model (for local vector creation)
+
+sentence-transformers
+
+#Local LLM Interface
+
+ollama
+pydantic
