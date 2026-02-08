@@ -1,6 +1,28 @@
 # knowledge_graph_semantic_search_agent
 
-Proof-of-concept that combines a Neo4j knowledge graph with a ChromaDB vector store and an Ollama-powered agent for multi-step queries.
+Proof-of-concept that combines a Neo4j knowledge graph with a ChromaDB vector store and an Ollama-powered agent for multi-step queries. The goal is to uplift Uber's search toward an agentic, neuro-symbolic architecture where structured rules (KG) and semantic similarity (vector) are fused into one answer.
+
+## Project Intent
+
+- Domain: Uber search uplift using a hybrid KG + vector approach.
+- Agent persona (system instruction): "Personalized Deal Finder."
+- Hard context: User U1 is always a Gold Member.
+- Tooling constraints: valid Cypher for KG queries, keyword-style inputs for vector search.
+
+## Agent Logic
+
+The agent uses a ReAct-style loop with a scratchpad to avoid repeated or circular tool calls:
+
+1) Thought: the LLM decides the next move.
+2) Action + Action Input: it selects a tool and provides parameters.
+3) Observation: it receives results from Neo4j or ChromaDB.
+4) Scratchpad: previous steps are retained via `{agent_scratchpad}` to keep state and prevent loops.
+
+## Goal
+
+Synthesize a single answer from two disconnected sources:
+- Unstructured dish descriptions (vector search).
+- Structured membership rules and promos (knowledge graph).
 
 ## Prereqs
 
