@@ -1,5 +1,7 @@
 chroma_data/
+chroma_data1/
 agent_poc_env/
 *.egg-info/
 .installed.cfg
 *.egg
+test_*

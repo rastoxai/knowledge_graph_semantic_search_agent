@@ -11,8 +11,11 @@ from langchain.tools import tool
 from langchain_core.prompts import PromptTemplate # Using the core prompt class now
 from langchain_core.runnables import RunnablePassthrough
 from typing import List, Dict, Any
+import chromadb 
 
 
+# --- Base Path ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- Configuration (Must match setup_data.py) ---
 # Neo4j Config
@@ -21,7 +24,7 @@ NEO4J_AUTH = ("neo4j", "password")
 NEO4J_DB = "neo4j"
 
 # ChromaDB Config
-CHROMA_PATH = "./chroma_data"
+CHROMA_PATH = os.path.join(BASE_DIR, "chroma_data")
 COLLECTION_NAME = "eats_dishes"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2" # Used by Chroma internally
 
@@ -31,6 +34,34 @@ OLLAMA_MODEL = "llama3" # Ensure you have run 'ollama pull llama3'
 # --- 1. Custom Tool Definitions ---
 
 # --- A. Knowledge Graph Tool (Structured Data) ---
+
+def resolve_chroma_collection(chroma_client):
+    collections = chroma_client.list_collections()
+    if not collections:
+        return None
+
+    name_map = {getattr(col, "name", col): col for col in collections}
+    if COLLECTION_NAME in name_map:
+        collection = chroma_client.get_collection(name=COLLECTION_NAME)
+        if collection.count() > 0:
+            return collection
+
+    for col in collections:
+        collection_name = getattr(col, "name", col)
+        collection = chroma_client.get_collection(name=collection_name)
+        if collection.count() > 0:
+            print(
+                f"[VECTOR TOOL NOTE]: Falling back to non-empty collection "
+                f"'{collection.name}' (configured name '{COLLECTION_NAME}' is empty)."
+            )
+            return collection
+
+    if COLLECTION_NAME in name_map:
+        return chroma_client.get_collection(name=COLLECTION_NAME)
+
+    fallback_name = getattr(collections[0], "name", collections[0])
+    return chroma_client.get_collection(name=fallback_name)
+
 
 @tool
 def knowledge_graph_search(cypher_query: str) -> str:
@@ -78,12 +109,27 @@ def semantic_dish_search(query: str) -> List[Dict[str, Any]]:
     
     # FIX: Using PersistentClient for robust disk loading
     try:
-        chroma_client = PersistentClient(path=CHROMA_PATH)
-        collection = chroma_client.get_collection(name=COLLECTION_NAME)
+        chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
     except Exception as e:
         # Provide a specific error if loading fails, just in case
-        return f"ChromaDB Load Error: Failed to initialize PersistentClient or find collection {COLLECTION_NAME}. Ensure 'chroma_data' exists and is populated. Error: {e}"
+        return [{
+            "error": (
+                "ChromaDB Load Error: Failed to initialize PersistentClient or find "
+                f"collection {COLLECTION_NAME}. Ensure 'chroma_data' exists and is "
+                f"populated. Error: {e}"
+            ),
+            "collection": None
+        }]
 
+    collection = resolve_chroma_collection(chroma_client)
+    if collection is None:
+        return [{"error": "No ChromaDB collections found.", "collection": None}]
+
+    if collection.count() == 0:
+        return [{
+            "error": "No documents found in the selected ChromaDB collection.",
+            "collection": collection.name
+        }]
 
     # Perform the query
     # Chroma automatically uses the default embedding model for query embedding
@@ -98,7 +144,10 @@ def semantic_dish_search(query: str) -> List[Dict[str, Any]]:
         # Return the list of metadata dictionaries
         return results['metadatas'][0]
     else:
-        return []
+        return [{
+            "error": "No semantic matches found for the query.",
+            "collection": collection.name
+        }]
 
 # --- 2. Agent Setup ---
 
@@ -114,6 +163,112 @@ def run_agent_poc(user_query: str):
     
     # 2. Define the Tools
     tools = [semantic_dish_search, knowledge_graph_search]
+
+    def needs_semantic_search(query: str) -> bool:
+        keywords = [
+            "dish", "taste", "craving", "flavor", "flavour", "spicy", "creamy",
+            "noodles", "sweet", "savory", "comfort food", "texture"
+        ]
+        lowered = query.lower()
+        return any(keyword in lowered for keyword in keywords)
+
+    def needs_kg_search(query: str) -> bool:
+        keywords = [
+            "promo", "promotion", "deal", "discount", "membership",
+            "gold", "silver", "favorite", "favors", "favours"
+        ]
+        lowered = query.lower()
+        return any(keyword in lowered for keyword in keywords)
+
+    def format_semantic_results(results):
+        if not results:
+            return "No matching dishes found in the vector store."
+        if isinstance(results, list) and results and "error" in results[0]:
+            return f"Semantic search error: {results[0]['error']}"
+
+        lines = ["Top matching dishes:"]
+        for item in results:
+            lines.append(
+                f"- {item.get('name')} (rating {item.get('rating')}, "
+                f"price {item.get('price')}, restaurant {item.get('restaurant_id')})"
+            )
+        return "\n".join(lines)
+
+    def run_complex_semantic_then_kg(query: str) -> str:
+        semantic_results = semantic_dish_search.invoke({"query": query})
+        if not semantic_results or (isinstance(semantic_results, list) and "error" in semantic_results[0]):
+            return format_semantic_results(semantic_results)
+
+        restaurant_ids = []
+        for item in semantic_results:
+            restaurant_id = item.get("restaurant_id")
+            if restaurant_id and restaurant_id not in restaurant_ids:
+                restaurant_ids.append(restaurant_id)
+
+        if not restaurant_ids:
+            return "Semantic search returned dishes without restaurant IDs."
+
+        promo_results = []
+        for restaurant_id in restaurant_ids:
+            cypher = (
+                "MATCH (r:Restaurant {id: '" + restaurant_id + "'})-[:OFFERS]->(p:Promo)"
+                "-[:REQUIRES_LEVEL]->(m:Membership {level: 'Gold'}) "
+                "RETURN r.name AS restaurant, p.code AS code, p.details AS details"
+            )
+            kg_response = knowledge_graph_search.invoke({"cypher_query": cypher})
+            try:
+                data = json.loads(kg_response)
+            except json.JSONDecodeError:
+                data = []
+            if data:
+                promo_results.extend(data)
+
+        dish_lines = ["Top matching dishes:"]
+        for item in semantic_results:
+            dish_lines.append(
+                f"- {item.get('name')} (rating {item.get('rating')}, "
+                f"price {item.get('price')}, restaurant {item.get('restaurant_id')})"
+            )
+
+        if not promo_results:
+            return "\n".join(dish_lines + ["No Gold promos found for those restaurants."])
+
+        promo_lines = ["Gold promos:"]
+        for promo in promo_results:
+            promo_lines.append(
+                f"- {promo.get('restaurant')}: {promo.get('code')} ({promo.get('details')})"
+            )
+
+        return "\n".join(dish_lines + promo_lines)
+
+    # Preflight: if vector store is empty, avoid looping on semantic search.
+    try:
+        chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+        collection = resolve_chroma_collection(chroma_client)
+    except Exception:
+        collection = None
+
+    if needs_semantic_search(user_query):
+        if collection is None or collection.count() == 0:
+            message = (
+                "Vector store is empty. Populate ChromaDB (run setup_data.py) "
+                "before running semantic queries."
+            )
+            print(f"\n--- Final Result ---\n{message}")
+            return message
+
+    # Short-circuit for semantic-only queries (avoid agent loops).
+    if needs_semantic_search(user_query) and not needs_kg_search(user_query):
+        results = semantic_dish_search.invoke({"query": user_query})
+        message = format_semantic_results(results)
+        print(f"\n--- Final Result ---\n{message}")
+        return message
+
+    # Deterministic two-step path for complex semantic + KG queries.
+    if needs_semantic_search(user_query) and needs_kg_search(user_query):
+        message = run_complex_semantic_then_kg(user_query)
+        print(f"\n--- Final Result ---\n{message}")
+        return message
     
     # 3. Define the Agent's Prompt/Instruction using the ReAct Template
     # This standard template is required for create_react_agent
@@ -122,8 +277,14 @@ def run_agent_poc(user_query: str):
         "from the Knowledge Graph (KG) and the Vector Search Index (Semantic Search) to answer "
         "complex user queries about food dishes, deals, and user status. "
         "The user is a Gold Member (User ID: U1). "
+        "KG schema: (User)-[:HAS_MEMBERSHIP]->(Membership {level}), "
+        "(Restaurant)-[:OFFERS]->(Promo), (Promo)-[:REQUIRES_LEVEL]->(Membership), "
+        "(User)-[:FAVORS]->(Restaurant). "
         "For knowledge_graph_search, the Action Input MUST be a single, valid Cypher query."
         "For semantic_dish_search, the Action Input MUST clearly extract keywords from the query."
+        "If semantic_dish_search returns an error or no results, do not retry the same tool; "
+        "Do not call the same tool with the same input more than once. "
+        "respond with the best available fallback."
         "After gathering information, synthesize a concise final answer."
     )
 
@@ -159,7 +320,7 @@ def run_agent_poc(user_query: str):
         tools=tools, 
         verbose=True,
         # Setting a higher max_iterations to allow the complex query to complete multiple tool steps
-        max_iterations=8,
+        max_iterations=6,
         handle_parsing_errors=True
     )
     
@@ -187,7 +348,7 @@ if __name__ == "__main__":
     run_agent_poc(complex_query)
     
     # Example simple query using only the KG
-    # run_agent_poc("What is the promo code for Thai Basil House?")
+    run_agent_poc("What is the promo code for Thai Basil House?")
     
     # Example simple query using only Vector Search
-    # run_agent_poc("I am craving something that tastes like rich, sweet comfort food noodles.")
+    run_agent_poc("I am craving something that tastes like rich, sweet comfort food noodles.")

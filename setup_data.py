@@ -1,8 +1,11 @@
 import os
+import chromadb
 from neo4j import GraphDatabase
-from chromadb import Client, Settings
 from sentence_transformers import SentenceTransformer
 from langchain_core.documents import Document
+
+# --- Base Path ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- Configuration ---
 # Neo4j Config
@@ -11,7 +14,7 @@ NEO4J_AUTH = ("neo4j", "password")
 NEO4J_DB = "neo4j"
 
 # ChromaDB Config
-CHROMA_PATH = "./chroma_data"
+CHROMA_PATH = os.path.join(BASE_DIR, "chroma_data")
 COLLECTION_NAME = "eats_dishes"
 
 # Embedding Model (must be local, small, and fast)
@@ -98,8 +101,8 @@ def setup_chromadb(data, path, collection_name, model_name):
     """Initializes and populates the ChromaDB Vector Store."""
     print("--- Setting up ChromaDB Vector Store ---")
     
-    # Initialize Chroma Client (Persistent storage for local PoC)
-    chroma_client = Client(Settings(persist_directory=path))
+    # Initialize Chroma Client (persistent storage for local PoC)
+    chroma_client = chromadb.PersistentClient(path=path)
     
     # Delete collection if it exists to ensure a clean start
     try:
@@ -141,6 +144,79 @@ def setup_chromadb(data, path, collection_name, model_name):
     
     print(f"ChromaDB setup complete. Indexed {len(documents)} dish descriptions.")
 
+# --- 4. Quick Checks (Neo4j + ChromaDB) ---
+
+def quick_check_neo4j(uri, auth, db_name):
+    """Prints a quick summary of KG data."""
+    print("\n--- Neo4j Quick Check ---")
+    driver = GraphDatabase.driver(uri, auth=auth)
+    try:
+        with driver.session(database=db_name) as session:
+            restaurants = session.run(
+                "MATCH (r:Restaurant) "
+                "RETURN r.id AS id, r.name AS name, r.rating AS rating "
+                "ORDER BY r.id"
+            ).data()
+
+            promos = session.run(
+                "MATCH (r:Restaurant)-[:OFFERS]->(p:Promo) "
+                "RETURN r.id AS restaurant_id, p.code AS code, p.details AS details "
+                "ORDER BY r.id, p.code"
+            ).data()
+
+        if not restaurants:
+            print("No Restaurant nodes found.")
+        else:
+            print(f"Restaurants found: {len(restaurants)}")
+            for row in restaurants:
+                print(f"  - {row['id']}: {row['name']} (rating {row['rating']})")
+
+        if not promos:
+            print("No Promo relationships found.")
+        else:
+            print(f"Promos found: {len(promos)}")
+            for row in promos:
+                print(
+                    f"  - {row['restaurant_id']}: {row['code']} "
+                    f"({row['details']})"
+                )
+    except Exception as exc:
+        print(f"Neo4j quick check failed: {exc}")
+    finally:
+        driver.close()
+
+
+def quick_check_chromadb(path, collection_name):
+    """Prints a quick summary of ChromaDB collection contents."""
+    print("\n--- ChromaDB Quick Check ---")
+    chroma_client = chromadb.PersistentClient(path=path)
+    try:
+        collection = chroma_client.get_collection(name=collection_name)
+    except Exception as exc:
+        print(f"ChromaDB quick check failed: {exc}")
+        return
+
+    count = collection.count()
+    print(f"Collection '{collection_name}' count: {count}")
+    if count == 0:
+        return
+
+    results = collection.get(
+        ids=None,
+        where=None,
+        limit=min(count, 5),
+        include=["documents", "metadatas"]
+    )
+
+    for i in range(len(results["ids"])):
+        doc_id = results["ids"][i]
+        document = results["documents"][i]
+        metadata = results["metadatas"][i]
+        print("-" * 20)
+        print(f"Record {i+1} (ID: {doc_id})")
+        print(f"  Metadata: {metadata}")
+        print(f"  Document: {document[:150]}...")
+
 # --- 4. Main Execution ---
 
 if __name__ == "__main__":
@@ -152,6 +228,10 @@ if __name__ == "__main__":
     
     # 2. Setup the ChromaDB Vector Store
     setup_chromadb(dishes_vector_data, CHROMA_PATH, COLLECTION_NAME, EMBEDDING_MODEL_NAME)
+
+    # 3. Quick checks
+    quick_check_neo4j(NEO4J_URI, NEO4J_AUTH, NEO4J_DB)
+    quick_check_chromadb(CHROMA_PATH, COLLECTION_NAME)
     
     print("\n\n*** PoC Data Setup Complete! ***")
     print("You can now connect LangChain to these two data sources in the next step.")
